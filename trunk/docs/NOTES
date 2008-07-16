@@ -1,0 +1,242 @@
+Disk setup:
+ _________________________________
+|                                 |
+|               sda               |
+|  _____________________________  |
+| |                             | |
+| |            sda1             | |
+| |          reiserfs           | |
+| |            5 GB             | |
+| |_____________________________| |
+|  _____________________________  |
+| |                             | |
+| |            sda2             | |
+| |   LUKS encrypted partition  | |
+| |  _________________________  | |
+| | |                         | | |
+| | |       sda2_crypt        | | |
+| | |   LVM Physical Volume   | | |
+| | |  _____________________  | | |
+| | | |                     | | | |
+| | | |       crypt         | | | |
+| | | |    Volume Group     | | | |
+| | | |  _________________  | | | |
+| | | | |                 | | | | |
+| | | | |   crypt-swap    | | | | |
+| | | | |  Logical Volume | | | | |
+| | | | |      swap       | | | | |
+| | | | |      2 GB       | | | | |
+| | | | |_________________| | | | |
+| | | |  _________________  | | | |
+| | | | |                 | | | | |
+| | | | |   crypt-drive   | | | | |
+| | | | |  Logical Volume | | | | |
+| | | | |    reiserfs     | | | | |
+| | | | |                 | | | | |
+| | | | |                 | | | | |
+| | | | |                 | | | | |
+| | | | |                 | | | | |
+| | | | |                 | | | | |
+| | | | |                 | | | | |
+| | | | |                 | | | | |
+| | | | |                 | | | | |
+| | | | |                 | | | | |
+| | | | |                 | | | | |
+| | | | |                 | | | | |
+| | | | |_________________| | | | |
+| | | |_____________________| | | |
+| | |_________________________| | |
+| |_____________________________| |
+|_________________________________|
+
+This is the way Ubuntu sets it up when you go through the partitioning process
+on the server or alternate install disks. So we'll stick with these
+conventions.
+
+The sizes are recommendations. On a desktop install, Ubuntu will easily require
+2.1GB. I typically use a swap partition the same size as my memory; you may
+want a larger or smaller. The important thing to remember is that you can more
+or less consider your first partition lost space, as nearly every file could be
+potentially be overwritten on your crypt-drive. So in the example above, your
+effective disk space is the size of your drive minus 7GB.
+
+During the install, set your user's password to be your duress password.
+
+After install:
+1) Upgrade kernel
+	$ sudo apt-get update
+	$ sudo apt-get install linux-generic linux-headers-generic \
+	> linux-image-generic linux-restricted-modules-generic
+	> linux-restricted-modules-common
+2) Upgrade apt
+	$ sudo apt-get install apt dpkg
+3) Upgrade initramfs and friends
+	$ sudo apt-get install initramfs-tools klibc-utils libklibc
+4) Uncomment /etc/apt/sources.list lines, if necessary
+5) Create /base, /crypt; mount crypt-drive on /crypt
+
+You will need the following utilities compiled as statically linked binaries:
+	- md5sum
+	- mkreiserfs (or a similar tool for your preferred filesystem)
+
+You will need the following hand-rolled utilities
+	- getpass
+		char*getpass(char*);int printf(char*,...);
+		int main(int c,char**v){char*p=getpass("");printf("%s",p);}
+
+Prepare unionfs:
+
+I like to do this on the crypt drive. There's no real need, as this part need
+not be secret. Arguably, it's better not to, as it would show a clear
+progression to a forensic analyst. Do what you will.
+
+If you want not to leave any trace, using `unset HISTFILE` whenever you open a
+new shell until you get the unionfs working will prevent bash from writing your
+history.
+
+With latest initramfs:
+	$ sudo mkdir $initrd_workingdir # Do not use /crypt{,/tmp}!
+	$ sudo chown -R you.you $initrd_workingdir
+	$ pushd $initrd_workingdir
+	$ scp host:getpass .
+	$ mkdir initrd
+	$ pushd initrd
+	$ zcat /boot/$initramfs | cpio -i -H newc
+
+	$ echo alias sha256 sha256_generic >> etc/modprobe.d/aliases
+	$ cp ../getpass bin
+	$ cp -R /lib/modules/$version/ubuntu/fs/aufs lib/modules/$version/
+
+scripts/local:mountroot() should have these additional lines:
+
+	modprobe aufs
+	mkdir -p /base
+	mkdir -p /crypt
+	mount -t reiserfs -o ro /dev/sda1 /base
+	mount -t reiserfs -o rw /dev/mapper/crypt-drive /crypt
+	mount -t aufs -o rw,dirs=/crypt=rw:/base=ro aufs /root
+	mkdir -p /root/base
+	mkdir -p /root/crypt
+	mount --move /base /root/base
+	mount --move /crypt /root/crypt
+
+The rest of the lines ought to be removed or commented out, except for the
+run_scripts lines.
+
+scripts/local-top/cryptroot:setup_mapping()
+	Replace
+		$cryptcreate < /dev/console > /dev/console 2>&1
+	With
+		echo -n "Enter encryption passphrase: "
+		PASS="$(getpass < /dev/console 2> /dev/console)"
+		echo -n "$PASS" | $cryptcreate > /dev/null 2>&1
+
+
+At this point, we should note that the changes we've made are not general
+changes. For instance, if you want to use ext3 and not reiserfs, your changes
+will need to reflect that.
+
+/etc/fstab should look something like this:
+
+proc			/proc	proc		defaults	0	0
+aufs			/	aufs		rw		0	0
+/dev/sda1		/base	reiserfs	ro,noauto	0	0
+/dev/mapper/crypt-drive	/crypt	reiserfs	rw,noauto	0	0
+/dev/mapper/crypt-swap	none	swap		sw		0	0
+
+Since sda1 and crypt-drive are being mounted by the initramfs scripts, we don't
+want to try mounting them again. It doesn't do anything bad, but it does make
+the word "fail" appear in red letters. But it's nice to have them around where
+we can see them, especially for remounting sda1 as rw and upgrading the kernel.
+
+Since it's possible we've made a mistake, we want to be able to treat our
+system like normal and get back on our feet. Therefore, let's abuse Ubuntu's
+backup scheme for our own purposes. The following commands are what I used at
+the time of this writing, though the latest available release and kernel may
+change this slightly.
+
+	$ pushd /boot
+	$ sudo cp initrd.img-2.6.24-16-generic{,.bak}
+	$ sudo cp initrd.img-2.6.24-1{9,6}-generic
+	$ popd
+
+And edit your grub so that -16 single user mode points to .bak, and -16
+regular points to the -19 kernel.
+
+We are now protected. Let's overwrite the initrd:
+
+	(We should be in the folder initrd we've been editing, as root)
+	# find . -print | cpio -o -H newc > /boot/initrd.img-2.6.24-19-generic
+
+If all has gone to plan, we should now have a working system. A base install of
+Ubuntu Linux, with an encrypted layer that catches any changes made. If all you
+want is to prevent a laptop thief from being able to access your private data,
+then you are done. Just make sure you don't leave the thing unlocked, or your
+data is there for the taking.
+
+Now, for the rest of us, it's time to get sneaky.
+
+You will need the following utilities compiled as statically linked binaries:
+	- md5sum
+	- mkreiserfs (or a similar tool for your preferred filesystem)
+
+Place these in the bin/ of your initrd working directory.
+
+Rerun this line:
+	$ sudo cp /boot/initrd.img-2.6.24-1{9,6}-generic
+
+We'll need the md5 of your duress password.
+
+	$ echo -n "$DURESS" | md5sum | sed -e 's/ .*//' 
+
+Let's suppose the result is: 03941b924d12454219648d61a7b025e2
+
+To scripts/local-top/cryptroot:setup_mapping(), we'll make the following
+modifications:
+	Replace
+		PASS="$(getpass < /dev/console 2> /dev/console)"
+		echo -n "$PASS" | $cryptcreate > /dev/null 2>&1
+	With
+		PASS="$(getpass < /dev/console 2> /dev/console)"
+		if [ "03941b924d12454219648d61a7b025e2" = `echo -n "$PASS" | md5sum | sed -e 's/ .*//'` ]
+		then
+			# Reformat crypt
+			echo -n "$PASS" | cryptsetup luksFormat /dev/sda2
+			echo -n "$PASS" | cryptsetup luksOpen /dev/sda2 sda2_crypt
+			ln -s /sbin/lvm /bin/pvcreate
+			ln -s /sbin/lvm /bin/vgcreate
+			ln -s /sbin/lvm /bin/vgchange
+			ln -s /sbin/lvm /bin/lvcreate
+			pvcreate /dev/mapper/sda2_crypt
+			vgcreate crypt /dev/mapper/sda2_crypt
+			vgchange -a y crypt
+			lvcreate -Cy -L2048 -nswap crypt
+			lvcreate -Cy -l +100%FREE -ndrive crypt
+			mkswap /dev/mapper/crypt-swap
+			mkreiserfs -q /dev/mapper/crypt-drive
+
+			# Hide our tracks
+			mkdir -p /base
+			mount -t reiserfs -o rw /dev/sda1 /base
+			#shred /base/boot/initrd.img-2.6.24-19-generic
+			cp /base/boot/initrd.img-2.6.24-16-generic /base/boot/initrd.img-2.6.24-19-generic
+
+			# Clean up so the scripts can do their thing
+			umount /base
+			vgchange -a n crypt
+			cryptsetup luksClose sda2_crypt
+		fi
+		echo -n "$PASS" | $cryptcreate > /dev/null 2>&1
+
+While shredding this initrd file before copying the duress one back would make
+things slightly harder, it would also take a few suspicious seconds to execute.
+The command is there to uncomment, if you choose.
+
+Note that you need to be very sure you've typed all of these commands
+correctly. Since using them is meant also to destroy them, they're tricky to
+debug. I recommend practicing in VMWare, using snapshots, then copying the
+working script to your live system.
+
+I think the next thing we will need to do is obviate the need for using shred
+by creating a script that is encrypted with your duress password to do the
+naughty things.
