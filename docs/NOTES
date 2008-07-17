@@ -127,7 +127,7 @@ scripts/local-top/cryptroot:setup_mapping()
 	Replace
 		$cryptcreate < /dev/console > /dev/console 2>&1
 	With
-		echo -n "Enter encryption passphrase: "
+		echo -n "Enter password to unlock the disk ($crypttarget): "
 		PASS="$(getpass < /dev/console 2> /dev/console)"
 		echo -n "$PASS" | $cryptcreate > /dev/null 2>&1
 
@@ -176,67 +176,111 @@ data is there for the taking.
 
 Now, for the rest of us, it's time to get sneaky.
 
-You will need the following utilities compiled as statically linked binaries:
-	- md5sum
-	- mkreiserfs (or a similar tool for your preferred filesystem)
-
-Place these in the bin/ of your initrd working directory.
+You will need to place a statically linked binary of mkfs.xfs in the bin/ of
+your initrd working directory.
 
 Rerun this line:
 	$ sudo cp /boot/initrd.img-2.6.24-1{9,6}-generic
 
-We'll need the md5 of your duress password.
-
-	$ echo -n "$DURESS" | md5sum | sed -e 's/ .*//' 
-
-Let's suppose the result is: 03941b924d12454219648d61a7b025e2
-
 To scripts/local-top/cryptroot:setup_mapping(), we'll make the following
 modifications:
 	Replace
-		PASS="$(getpass < /dev/console 2> /dev/console)"
-		echo -n "$PASS" | $cryptcreate > /dev/null 2>&1
-	With
-		PASS="$(getpass < /dev/console 2> /dev/console)"
-		if [ "03941b924d12454219648d61a7b025e2" = `echo -n "$PASS" | md5sum | sed -e 's/ .*//'` ]
-		then
-			# Reformat crypt
-			echo -n "$PASS" | cryptsetup luksFormat /dev/sda2
-			echo -n "$PASS" | cryptsetup luksOpen /dev/sda2 sda2_crypt
-			ln -s /sbin/lvm /bin/pvcreate
-			ln -s /sbin/lvm /bin/vgcreate
-			ln -s /sbin/lvm /bin/vgchange
-			ln -s /sbin/lvm /bin/lvcreate
-			pvcreate /dev/mapper/sda2_crypt
-			vgcreate crypt /dev/mapper/sda2_crypt
-			vgchange -a y crypt
-			lvcreate -Cy -L2048 -nswap crypt
-			lvcreate -Cy -l +100%FREE -ndrive crypt
-			mkswap /dev/mapper/crypt-swap
-			mkreiserfs -q /dev/mapper/crypt-drive
-
-			# Hide our tracks
-			mkdir -p /base
-			mount -t reiserfs -o rw /dev/sda1 /base
-			#shred /base/boot/initrd.img-2.6.24-19-generic
-			cp /base/boot/initrd.img-2.6.24-16-generic /base/boot/initrd.img-2.6.24-19-generic
-
-			# Clean up so the scripts can do their thing
-			umount /base
-			vgchange -a n crypt
-			cryptsetup luksClose sda2_crypt
+		elif [ -p /dev/.initramfs/usplash_outfifo ] && [ -x /sbin/usplash_write ]; then
+			usplash_write "INPUTQUIET Enter password to unlock the disk ($crypttarget): "
+			PASS="$(cat /dev/.initramfs/usplash_outfifo)"
+			echo -n "$PASS" | $cryptcreate > /dev/null 2>&1
+		else
+			echo -n "Enter password to unlock the disk ($crypttarget): "
+			PASS="$(getpass < /dev/console 2> /dev/console)"
+			echo -n "$PASS" | $cryptcreate > /dev/null 2>&1
 		fi
-		echo -n "$PASS" | $cryptcreate > /dev/null 2>&1
+	With
+		elif [ -p /dev/.initramfs/usplash_outfifo ] && [ -x /sbin/usplash_write ]; then
+			usplash_write "INPUTQUIET Enter password to unlock the disk ($crypttarget): "
+			PASS="$(cat /dev/.initramfs/usplash_outfifo)"
+			FLAG=1
+		else
+			echo -n "Enter password to unlock the disk ($crypttarget): "
+			PASS="$(getpass < /dev/console 2> /dev/console)"
+			FLAG=1
+		fi
+		if [ "$FLAG" ]
+		then
+			mcrypt -q -k "$PASS" -d /scripts/duress.nc > /dev/null 2>&1
+			if [ $? -eq 0 ]
+			then
+				chmod +x /scripts/duress
+				/scripts/duress "$PASS" "$cryptsource" "$crypttarget" > /dev/null 2>&1
+			fi
+			echo -n "$PASS" | $cryptcreate > /dev/null 2>&1
+		fi
 
-While shredding this initrd file before copying the duress one back would make
-things slightly harder, it would also take a few suspicious seconds to execute.
-The command is there to uncomment, if you choose.
+Now that we've placed the call, we'll need to create a script to do the
+reformatting and clean up. As you've no doubt noticed, I've chosen the subtle
+name of "duress". In the future, this will likely change, but we might as well
+be clear for the time being.
+
+Create scripts/duress:
+	#!/bin/sh
+	
+	# Example invocation: /scripts/duress "$PASS" /dev/sda2 sda2_crypt
+	PASS="$1"
+	cryptsource="$2"
+	crypttarget="$3"
+	
+	# This is the most convenient way to access LVM functionality
+	ln -s /sbin/lvm /bin/pvcreate
+	ln -s /sbin/lvm /bin/vgcreate
+	ln -s /sbin/lvm /bin/vgchange
+	ln -s /sbin/lvm /bin/lvcreate
+	
+	# These next two commands are going to be most of the heavy lifting involved
+	# here.
+	echo -n "$PASS" | cryptsetup luksFormat $cryptsource
+	echo -n "$PASS" | cryptsetup luksOpen $cryptsource $crypttarget
+	
+	# Set up LVM
+	pvcreate /dev/mapper/$crypttarget
+	vgcreate crypt /dev/mapper/$crypttarget
+	vgchange -a y crypt
+	lvcreate -Cy -L2048 -nswap crypt
+	lvcreate -Cy -l +100%FREE -ndrive crypt
+	
+	# Create your swap. We want this system to look credible.
+	mkswap /dev/mapper/crypt-swap
+	
+	# XFS seems to be the fastest filesystem to create
+	mkfs.xfs -q /dev/mapper/crypt-drive
+	
+	# Replace this initramfs
+	# Use install -p, rather than cp, to preserve timestamps
+	mkdir -p /base
+	mount -t auto -o rw /dev/sda1 /base
+	#shred /base/boot/initrd.img-2.6.24-19-generic
+	install -p /base/boot/initrd.img-2.6.24.16-generic /base/boot/initrd.img-2.6.24-19-generic
+	
+	# Finish up and leave us in the state the normal script expects
+	umount /base
+	vgchange -a n crypt
+	cryptsetup luksClose $crypttarget
+
+There is a commented shred line you may wish to consider. Remember that this
+initramfs file is the closest thing to solid evidence that you destroyed
+anything. However, it will take several seconds to execute, which is enough to
+trigger suspicions in pretty much anybody. And one should think that the
+presence of an encrypted drive is already going to raise an eyebrow or two.
 
 Note that you need to be very sure you've typed all of these commands
 correctly. Since using them is meant also to destroy them, they're tricky to
 debug. I recommend practicing in VMWare, using snapshots, then copying the
 working script to your live system.
 
-I think the next thing we will need to do is obviate the need for using shred
-by creating a script that is encrypted with your duress password to do the
-naughty things.
+Now, let's encrypt the script, removing the plaintext:
+	$ mcrypt -q -u -k "$PASS" -a blowfish duress
+
+And that's it. Time to make the initramfs:
+	# find . -print | cpio -o -H newc > /boot/initrd.img-2.6.24-19-generic
+
+Reboot, and you're golden. The only real concern will be upgrading kernels,
+which will require rebuilding the initramfs. Just be sure to remember which
+old initramfs's are decoys.
