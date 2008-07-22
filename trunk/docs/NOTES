@@ -98,8 +98,7 @@ You will also need a simple program to read a string without echoing to screen
 and print the input without a trailing newline. The following will work,
 compiled with gcc (clearly not ISO/ANSI/$FOOSTANDARD compliant):
 
-	char*getpass(char*);int printf(char*,...);
-	main(){char*p=getpass("");printf("%s",p);}
+char*getpass(char*);int printf(char*,...);main(){printf("%s",getpass(""));}
 
 Prepare unionfs:
 
