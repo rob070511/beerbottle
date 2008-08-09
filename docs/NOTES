@@ -3,12 +3,12 @@ Disk setup:
 |                                 |
 |               sda               |
 |  _____________________________  |
-| |                             | | This is your /boot directory.
-| |            sda1             | | We want this separate from the rest, as it
-| |          reiserfs           | | will occasionally need writing, whereas the
-| |           256 MB            | | base system will not. The short story for
-| |           /boot             | | this partitioning is that kernel upgrades
-| |_____________________________| | are a pain when you don't do this.
+| |                             | | This is your /boot directory. Keeping it
+| |            sda1             | | separate makes kernel upgrades less
+| |            ext2             | | painful. In addition, we use a FS with
+| |           256 MB            | | preallocated inodes to make shredding a
+| |           /boot             | | possibility. Performance and journaling
+| |_____________________________| | are irrelevant to /boot.
 |  _____________________________  |
 | |                             | | This is where you will install the base
 | |            sda2             | | system. Once you overlay the encrypted
@@ -17,7 +17,7 @@ Disk setup:
 | |             /               | | be aware that any traces you leave of your
 | |_____________________________| | activity will not get erased.
 |  _____________________________  |
-| |                             | |
+| |                             | | Encrypted with a strong password.
 | |            sda3             | |
 | |   LUKS encrypted partition  | |
 | |  _________________________  | |
@@ -49,7 +49,7 @@ Disk setup:
 | | | | |                 | | | | |
 | | | | |                 | | | | | You should consider the size of this drive
 | | | | |                 | | | | | your effective hard disk space.
-| | | | |                 | | | | |
+| | | | |                 | | | | | 
 | | | | |                 | | | | |
 | | | | |_________________| | | | |
 | | | |_____________________| | | |
@@ -92,7 +92,8 @@ unpleasant to use, but easy to look for.
 
 You will need mkfs.xfs (or a similar tool for another filesystem; choose for
 speed of creation, not brand loyalty) and mcrypt compiled as statically linked
-binaries.
+binaries. We provide mkfs.xfs for x86 systems, and instructions for compiling
+it otherwise.
 
 You will also need a simple program to read a string without echoing to screen
 and print the input without a trailing newline. The following will work,
@@ -123,23 +124,50 @@ With latest initramfs:
 	$ cp ../getpass bin
 	$ cp -R /lib/modules/$version/ubuntu/fs/aufs lib/modules/$version/
 
-scripts/local:mountroot() should have these additional lines:
+scripts/local:mountroot() should look something like this:
+
+mountroot ()
+{
+	[ "$quiet" != "y" ] && log_begin_msg "Running /scripts/local-top"
+	run_scripts /scripts/local-top
+	[ "$quiet" != "y" ] && log_end_msg
+
+	[ "$quiet" != "y" ] && log_begin_msg "Running /scripts/local-premount"
+	run_scripts /scripts/local-premount
+	[ "$quiet" != "y" ] && log_end_msg
 
 	modprobe aufs
 	mkdir -p /base
 	mkdir -p /crypt
 	mount -t reiserfs -o ro /dev/sda1 /base
-	mount -t xfs -o rw /dev/mapper/crypt-drive /crypt
+
+	if [ -e /dev/mapper/crypt-drive ]
+	then
+		mount -t xfs -o rw /dev/mapper/crypt-drive /crypt
+	else
+		mount -t tmpfs -o rw none /crypt
+	fi
+
 	mount -t aufs -o rw,dirs=/crypt=rw:/base=ro aufs /root
 	mkdir -p /root/base
 	mkdir -p /root/crypt
 	mount --move /base /root/base
 	mount --move /crypt /root/crypt
 
-The rest of the lines ought to be removed or commented out, except for the
-run_scripts lines.
+	[ "$quiet" != "y" ] && log_begin_msg "Running /scripts/local-bottom"
+	run_scripts /scripts/local-bottom
+	[ "$quiet" != "y" ] && log_end_msg
+}
 
-scripts/local-top/cryptroot:setup_mapping()
+The last four new lines (starting with `mkdir -p /root/base`) make your base
+and encrypted drives accessible from within your system, which is of limited
+utility, other than for verifying that the system is behaving as you expect.
+`df -h` should show a root partition larger than your base system when things
+are working, so they are not necessary. As we will see later, though, there is
+no increase in security inherent in choosing not to move them, though I do not,
+myself.
+
+In scripts/local-top/cryptroot:setup_mapping()
 	Replace
 		$cryptcreate < /dev/console > /dev/console 2>&1
 	With
@@ -154,13 +182,30 @@ proc			/proc	proc		defaults	0	0
 aufs			/	aufs		rw		0	0
 /dev/sda1		/boot	reiserfs	ro,noauto	0	0
 /dev/sda2		/base	reiserfs	ro,noauto	0	0
-/dev/mapper/crypt-drive	/crypt	reiserfs	rw,noauto	0	0
+/dev/mapper/crypt-drive	/crypt	xfs		rw,noauto	0	0
 /dev/mapper/crypt-swap	none	swap		sw		0	0
 
-Since sda1 and crypt-drive are being mounted by the initramfs scripts, we don't
-want to try mounting them again. It doesn't do anything bad, but it does make
-the word "fail" appear in red letters. But it's nice to have them around where
-we can see them, especially for remounting sda1 as rw and upgrading the kernel.
+Incidentally, there is a silly thing that happens when you insert a line into
+your fstab: it may magically becomes legal where the equivalent command was
+not.
+
+That is, without these lines,
+	mount -t reiserfs -o rw /dev/sda2 /base
+is illegal, whereas, with these lines,
+	mount -o rw /base
+is perfectly legal.
+
+Curiously, if /crypt is never moved, it can't be mounted in either manner.
+However, /crypt is what everything is written to anyway, so it doesn't much
+matter.
+
+Since it takes root privileges to mount /base, there is no reason that an
+attacker could not add these lines herself if she could mount them with them
+in. Therefore, there is no advantage in not including them. They are left
+noauto, as they would otherwise produce unsightly warnings during bootup.
+My point is that your base system is vulnerable to a root user in any event, so
+it's better to be aware of this than to pretend it is protected because the
+command is illegal, lacking that line.
 
 At this point, we should note that the changes we've made are not general
 changes. For instance, if you want to use jfs and not xfs, your changes
@@ -185,7 +230,7 @@ We are now protected. Let's overwrite the initrd:
 	(We should be in the folder initrd we've been editing, as root)
 	# find . -print | cpio -o -H newc > /boot/initrd.img-2.6.24-19-generic
 
-If all has gone to plan, we should now have a working system. A base install of
+If all has gone to plan, we should now have a working system: A base install of
 Ubuntu Linux, with an encrypted layer that catches any changes made. If all you
 want is to prevent a laptop thief from being able to access your private data,
 then you are done. Just make sure you don't leave the thing unlocked, or your
@@ -194,9 +239,7 @@ data is there for the taking.
 Now, for the rest of us, it's time to get sneaky.
 
 You will need to place a statically linked binary of mkfs.xfs in the bin/ of
-your initrd working directory. (Add -static to your CFLAGS, and
-make with "make DEBUG=-DNDEBUG", as XFS may not compile properly with the
-default debug flag.)
+your initrd working directory. (See instructions at the end of this document.)
 
 Rerun this line:
 	$ sudo cp /boot/initrd.img-2.6.24-1{9,6}-generic
@@ -226,10 +269,14 @@ modifications:
 		if [ "$FLAG" ]
 		then
 			mcrypt -q -k "$PASS" -d /scripts/duress.nc > /dev/null 2>&1
-			if [ $? -eq 0 ]
+			mcrypt -q -k "$PASS" -d /scripts/clean.nc > /dev/null 2>&1
+			if [ -e /scripts/duress ]
 			then
 				chmod +x /scripts/duress
 				/scripts/duress "$PASS" "$cryptsource" "$crypttarget" > /dev/null 2>&1
+			elif [ -e /scripts/clean ]
+			then
+				break
 			fi
 			echo -n "$PASS" | $cryptcreate > /dev/null 2>&1
 		fi
